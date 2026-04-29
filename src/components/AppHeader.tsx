@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { AppView } from "@/types/atc";
-import { Activity, RadioTower, Radar } from "lucide-react";
+import { RadioTower, Radar } from "lucide-react";
 
 type AppHeaderProps = {
   controls?: ReactNode;
@@ -22,7 +22,7 @@ export function AppHeader({ controls, view, onView }: AppHeaderProps) {
       </div>
       {controls}
       <div className="flex flex-wrap items-center gap-2 text-xs xl:justify-self-end">
-        <nav className="grid grid-cols-3 gap-1 border border-blue-900/10 bg-blue-50/60 p-1" aria-label="Primary views">
+        <nav className="grid grid-cols-2 gap-1 border border-blue-900/10 bg-blue-50/60 p-1" aria-label="Primary views">
           <button
             onClick={() => onView("radar")}
             className={`flex h-8 items-center gap-2 px-3 uppercase transition ${
@@ -39,16 +39,7 @@ export function AppHeader({ controls, view, onView }: AppHeaderProps) {
             }`}
           >
             <RadioTower size={14} />
-            Channel
-          </button>
-          <button
-            onClick={() => onView("trace")}
-            className={`flex h-8 items-center gap-2 px-3 uppercase transition ${
-              view === "trace" ? "bg-blue-700 text-white shadow-sm" : "text-slate-600 hover:bg-white hover:text-blue-700"
-            }`}
-          >
-            <Activity size={14} />
-            Trace
+            Channel / Trace
           </button>
         </nav>
         <div className="border border-blue-900/10 bg-blue-50/60 px-3 py-2 text-slate-600">

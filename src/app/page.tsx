@@ -2,24 +2,28 @@
 
 import { AircraftInspector } from "@/components/AircraftInspector";
 import { AppHeader } from "@/components/AppHeader";
-import { ChannelView } from "@/components/ChannelView";
+import { ChannelTraceView } from "@/components/ChannelTraceView";
 import { ControlPanel } from "@/components/ControlPanel";
 import { MetricsPanel } from "@/components/MetricsPanel";
 import { RadarMap } from "@/components/RadarMap";
 import { SequencePanel } from "@/components/SequencePanel";
-import { TraceView } from "@/components/TraceView";
+import { applySpokenAtcInstruction } from "@/lib/atc-clearance";
 import { formatDuration } from "@/lib/format";
-import { calculateMetrics, generateAircraft, moveAircraftAt } from "@/lib/simulation";
+import { calculateMetrics, formatSimulationClock, generateAircraft, moveAircraftAt, simulationSecondsFromSlot } from "@/lib/simulation";
 import type { Aircraft, AppView, AtcPlanAssignment, AtcTraceItem, ControlMode, DemoSpeed, FeedItem, Phase, RadioInstructionRequest, TrafficLevel } from "@/types/atc";
 import type { Dispatch, SetStateAction } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-const REAL_TICK_MS = 900;
+const REAL_TICK_MS = 1000;
 const RADIO_INTER_MESSAGE_GAP_MS = 650;
 const INTERNAL_DIRECTIVE_GAP_MS = 750;
 const ROUTINE_CLEARANCE_INTERVAL_SECONDS = 90;
+const RADIO_STALE_SECONDS = 90;
+const MAX_RADIO_QUEUE_ITEMS = 10;
 let feedItemSequence = 0;
 type RadioQueueItem = FeedItem | RadioInstructionRequest;
+type SimulationTimeRef = { current: number };
+type DemoSpeedRef = { current: DemoSpeed };
 
 export default function Home() {
   const [traffic, setTraffic] = useState<TrafficLevel>("light");
@@ -35,19 +39,29 @@ export default function Home() {
   const [planned, setPlanned] = useState(false);
   const [talkingAircraftId, setTalkingAircraftId] = useState("");
   const radioQueueRef = useRef<RadioQueueItem[]>([]);
+  const runwayClearanceIdsRef = useRef<Set<string>>(new Set());
   const radioActiveRef = useRef(false);
   const radioStoppedRef = useRef(false);
+  const simulationTimeRef = useRef(0);
+  const demoSpeedRef = useRef<DemoSpeed>(demoSpeed);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    demoSpeedRef.current = demoSpeed;
+  }, [demoSpeed]);
 
   useEffect(() => {
     if (!running) return;
     const id = window.setInterval(() => {
       setTick((value) => {
         const activeTick = value + demoSpeed;
+        simulationTimeRef.current = activeTick;
         setAircraft((current) => {
           const updated = current.map((ac) => moveAircraftAt(ac, mode, demoSpeed, activeTick));
-          const events = createFeedEvents(current, updated, mode, value, activeTick);
-          if (events.length) radioQueueRef.current.push(...events);
+          const events = createFeedEvents(current, updated, mode, value, activeTick, runwayClearanceIdsRef.current);
+          if (events.length) {
+            radioQueueRef.current = enqueueRadioEvents(radioQueueRef.current, events, activeTick);
+          }
           return updated;
         });
         return activeTick;
@@ -62,7 +76,7 @@ export default function Home() {
     radioStoppedRef.current = false;
     radioActiveRef.current = true;
 
-    runRadioScheduler(radioQueueRef, radioStoppedRef, audioRef, setFeed, setTrace, setTalkingAircraftId).finally(() => {
+    runRadioScheduler(radioQueueRef, radioStoppedRef, simulationTimeRef, demoSpeedRef, audioRef, setAircraft, setFeed, setTrace, setTalkingAircraftId).finally(() => {
       radioActiveRef.current = false;
       setTalkingAircraftId("");
     });
@@ -79,6 +93,8 @@ export default function Home() {
   const radarAircraft = aircraft.filter((ac) => ac.phase !== "scheduled" && ac.phase !== "landed" && ac.phase !== "departed");
   const selected = aircraft.find((ac) => ac.id === selectedId);
   const metrics = useMemo(() => calculateMetrics(aircraft, mode), [aircraft, mode]);
+  const simulationClock = useMemo(() => formatSimulationClock(tick), [tick]);
+  const arrivalCue = useMemo(() => arrivalDueCue(aircraft, tick), [aircraft, tick]);
 
   const resetScenario = () => {
     setAircraft([]);
@@ -88,10 +104,12 @@ export default function Home() {
     setPlanned(false);
     setTalkingAircraftId("");
     radioQueueRef.current = [];
+    runwayClearanceIdsRef.current = new Set();
     radioStoppedRef.current = true;
     audioRef.current?.pause();
     audioRef.current = null;
     window.speechSynthesis?.cancel();
+    simulationTimeRef.current = 0;
     setTick(0);
     setRunning(false);
   };
@@ -100,17 +118,21 @@ export default function Home() {
     if (value && !running && aircraft.length === 0) {
       const generated = generateAircraft(mode, traffic);
       const planned = await planAircraft(generated, mode);
-      setAircraft(planned.aircraft);
+      const syncedAircraft = synchronizeAircraftToClock(planned.aircraft, mode, 0);
+      setAircraft(syncedAircraft);
       setTrace([...planned.trace].reverse());
       setPlanned(true);
-      radioQueueRef.current = createInitialQueue(planned.aircraft, mode, 0);
+      radioQueueRef.current = createInitialQueue(syncedAircraft, mode, 0);
+      runwayClearanceIdsRef.current = new Set();
+      simulationTimeRef.current = 0;
       setTick(0);
     } else if (value && !running && feed.length === 0) {
       const plannedResult = planned ? { aircraft, trace: [] } : await planAircraft(aircraft, mode);
-      setAircraft(plannedResult.aircraft);
+      const syncedAircraft = synchronizeAircraftToClock(plannedResult.aircraft, mode, tick);
+      setAircraft(syncedAircraft);
       if (plannedResult.trace.length) setTrace((items) => [[...plannedResult.trace].reverse(), items].flat().slice(0, 160));
       setPlanned(true);
-      radioQueueRef.current.push(...createInitialQueue(plannedResult.aircraft, mode, tick));
+      radioQueueRef.current = pruneRadioQueue([...radioQueueRef.current, ...createInitialQueue(syncedAircraft, mode, tick)], tick);
     }
     if (!value) {
       radioStoppedRef.current = true;
@@ -126,14 +148,17 @@ export default function Home() {
     const generated = generateAircraft("ai", traffic);
     setMode("ai");
     planAircraft(generated, "ai").then((planned) => {
-      setAircraft(planned.aircraft);
+      const syncedAircraft = synchronizeAircraftToClock(planned.aircraft, "ai", 0);
+      setAircraft(syncedAircraft);
       setSelectedId("");
       setFeed([]);
       setTrace([...planned.trace].reverse());
       setPlanned(true);
       setTalkingAircraftId("");
-      radioQueueRef.current = createInitialQueue(planned.aircraft, "ai", 0);
+      radioQueueRef.current = createInitialQueue(syncedAircraft, "ai", 0);
+      runwayClearanceIdsRef.current = new Set();
       radioStoppedRef.current = false;
+      simulationTimeRef.current = 0;
       setTick(0);
       setRunning(true);
     });
@@ -169,17 +194,19 @@ export default function Home() {
         />
 
         {view === "channel" ? (
-          <ChannelView feed={feed} mode={mode} />
-        ) : view === "trace" ? (
-          <TraceView trace={trace} mode={mode} />
+          <ChannelTraceView feed={feed} trace={trace} mode={mode} />
         ) : (
         <section className="grid min-h-0 flex-1 gap-4 p-4 xl:grid-cols-[minmax(0,1fr)_390px]">
           <div className="min-h-[560px] xl:min-h-0">
             <div className="relative h-full min-h-[560px] overflow-hidden border border-blue-900/10 bg-[#edf5fb] shadow-sm xl:min-h-0">
-              <div className="pointer-events-none absolute left-4 top-4 z-[500] flex items-center gap-3 border border-blue-600/15 bg-white/85 px-3 py-2 font-mono text-xs text-blue-950 shadow-sm backdrop-blur">
+              <div className="pointer-events-none absolute left-4 top-4 z-[500] flex max-w-[calc(100%-2rem)] flex-wrap items-center gap-3 border border-blue-600/15 bg-white/85 px-3 py-2 font-mono text-xs text-blue-950 shadow-sm backdrop-blur">
                 <span className="h-2 w-2 rounded-full bg-blue-600 shadow-[0_0_12px_rgba(37,99,235,.45)]" />
                 LIVE TERMINAL RADAR
+                <span className="text-blue-900">{simulationClock} SYD</span>
                 <span className="text-slate-500">T+{formatDuration(tick)}</span>
+                <span className="text-blue-700">
+                  {arrivalCue ? `${arrivalCue.label} ${arrivalCue.aircraft.callsign} ${arrivalCue.aircraft.slot}` : "NEXT --"}
+                </span>
                 <span className="text-blue-700">{demoSpeed}x demo</span>
               </div>
               <div className="pointer-events-none absolute right-4 top-4 z-[500] grid grid-cols-3 gap-2 text-[11px]">
@@ -259,25 +286,96 @@ function releasePhaseForAssignment(phase: Phase, fallback: Aircraft["releasePhas
   return phase;
 }
 
-function createFeedEvents(previous: Aircraft[], next: Aircraft[], mode: ControlMode, previousTick: number, activeTick: number): RadioQueueItem[] {
+function synchronizeAircraftToClock(aircraft: Aircraft[], mode: ControlMode, tick: number) {
+  return aircraft.map((ac) => moveAircraftAt(ac, mode, 0, tick));
+}
+
+function arrivalDueCue(aircraft: Aircraft[], tick: number) {
+  const next = aircraft
+    .filter((ac) => ac.operation === "arrival" && ac.phase !== "landed" && ac.phase !== "departed")
+    .map((ac) => ({ ac, slotSeconds: simulationSecondsFromSlot(ac.slot) }))
+    .filter((item): item is { ac: Aircraft; slotSeconds: number } => item.slotSeconds !== null)
+    .sort((a, b) => a.slotSeconds - b.slotSeconds || a.ac.sequence - b.ac.sequence)[0];
+
+  if (!next) return null;
+
+  return {
+    aircraft: next.ac,
+    label: next.slotSeconds <= tick + 20 ? "DUE" : "NEXT",
+  };
+}
+
+function createFeedEvents(
+  previous: Aircraft[],
+  next: Aircraft[],
+  mode: ControlMode,
+  previousTick: number,
+  activeTick: number,
+  issuedRunwayClearances: Set<string>,
+): RadioQueueItem[] {
+  const runwayEvents = createRunwayClearanceEvents(next, mode, activeTick, issuedRunwayClearances);
+  const runwayAircraftIds = new Set(runwayEvents.map((event) => event.aircraftId));
   const phaseEvents = next
     .flatMap((ac) => {
       const before = previous.find((item) => item.id === ac.id);
       if (!before || before.phase === ac.phase || ac.phase === "landed" || ac.phase === "departed") return [];
-      return [createAgentExchangeRequest(ac, phaseHeading(ac), `${ac.callsign} now ${ac.phase}; ${ac.instruction}`, mode)];
+      if (runwayAircraftIds.has(ac.id)) return [];
+      return [createAgentExchangeRequest(ac, phaseHeading(ac), `${ac.callsign} now ${ac.phase}; ${ac.instruction}`, mode, activeTick)];
     })
     .filter(Boolean) as RadioQueueItem[];
 
   const shouldIssueClearance =
     Math.floor(activeTick / ROUTINE_CLEARANCE_INTERVAL_SECONDS) !== Math.floor(previousTick / ROUTINE_CLEARANCE_INTERVAL_SECONDS);
-  if (!shouldIssueClearance) return phaseEvents;
+  if (!shouldIssueClearance) return [...runwayEvents, ...phaseEvents];
 
-  const active = next.filter((ac) => ac.phase !== "scheduled" && ac.phase !== "landed" && ac.phase !== "departed");
-  const selected = active[Math.floor(activeTick / ROUTINE_CLEARANCE_INTERVAL_SECONDS) % Math.max(active.length, 1)];
-  if (!selected) return phaseEvents;
+  const selected = selectClearanceAircraft(next, activeTick);
+  if (!selected || runwayAircraftIds.has(selected.id)) return [...runwayEvents, ...phaseEvents];
 
   const before = previous.find((item) => item.id === selected.id);
-  return [createAgentExchangeRequest(selected, clearanceHeading(before, selected, mode), selected.instruction, mode), ...phaseEvents];
+  return [createAgentExchangeRequest(selected, clearanceHeading(before, selected, mode), selected.instruction, mode, activeTick), ...runwayEvents, ...phaseEvents];
+}
+
+function createRunwayClearanceEvents(aircraft: Aircraft[], mode: ControlMode, activeTick: number, issuedRunwayClearances: Set<string>) {
+  return aircraft.flatMap((ac) => {
+    if (ac.phase === "landed" || ac.phase === "departed") return [];
+
+    if (ac.operation === "departure" && ac.phase === "takeoff") {
+      const clearanceKey = `${ac.id}:takeoff`;
+      if (issuedRunwayClearances.has(clearanceKey)) return [];
+
+      issuedRunwayClearances.add(clearanceKey);
+      return [createAgentExchangeRequest(ac, "CLEARED TAKEOFF", ac.instruction, mode, activeTick)];
+    }
+
+    if (ac.operation === "arrival" && ac.phase === "final" && landingClearanceDue(ac, activeTick)) {
+      const clearanceKey = `${ac.id}:land`;
+      if (issuedRunwayClearances.has(clearanceKey)) return [];
+
+      issuedRunwayClearances.add(clearanceKey);
+      return [createAgentExchangeRequest(ac, "CLEARED TO LAND", `${ac.callsign}, runway three four left, cleared to land`, mode, activeTick)];
+    }
+
+    return [];
+  });
+}
+
+function landingClearanceDue(ac: Aircraft, activeTick: number) {
+  const slotSeconds = simulationSecondsFromSlot(ac.slot);
+  if (slotSeconds === null) return false;
+  return activeTick >= slotSeconds - 75 && activeTick <= slotSeconds + 20;
+}
+
+function selectClearanceAircraft(aircraft: Aircraft[], activeTick: number) {
+  return aircraft
+    .filter((ac) => ac.phase !== "scheduled" && ac.phase !== "landed" && ac.phase !== "departed")
+    .map((ac) => ({ ac, slotSeconds: simulationSecondsFromSlot(ac.slot) }))
+    .filter((item): item is { ac: Aircraft; slotSeconds: number } => item.slotSeconds !== null)
+    .filter((item) => item.slotSeconds >= activeTick - 90 && item.slotSeconds <= activeTick + 900)
+    .sort((a, b) => {
+      const aOverdue = a.slotSeconds <= activeTick ? 0 : 1;
+      const bOverdue = b.slotSeconds <= activeTick ? 0 : 1;
+      return aOverdue - bOverdue || a.slotSeconds - b.slotSeconds || a.ac.sequence - b.ac.sequence;
+    })[0]?.ac;
 }
 
 function createInitialQueue(aircraft: Aircraft[], mode: ControlMode, tick: number): RadioQueueItem[] {
@@ -306,12 +404,13 @@ function createInitialQueue(aircraft: Aircraft[], mode: ControlMode, tick: numbe
           ? `${ac.callsign}, identified, expect runway 34L departure release ${ac.slot}`
           : `${ac.callsign}, identified, expect ILS 34L, slot ${ac.slot}`,
         mode,
+        tick,
       ),
     ),
   ];
 }
 
-function createAgentExchangeRequest(ac: Aircraft, heading: string, instruction: string, mode: ControlMode): RadioInstructionRequest {
+function createAgentExchangeRequest(ac: Aircraft, heading: string, instruction: string, mode: ControlMode, issuedAt: number): RadioInstructionRequest {
   return {
     type: "agentExchange",
     aircraftId: ac.id,
@@ -319,13 +418,17 @@ function createAgentExchangeRequest(ac: Aircraft, heading: string, instruction: 
     heading,
     instruction,
     mode,
+    issuedAt,
   };
 }
 
 async function runRadioScheduler(
   radioQueueRef: { current: RadioQueueItem[] },
   radioStoppedRef: { current: boolean },
+  simulationTimeRef: SimulationTimeRef,
+  demoSpeedRef: DemoSpeedRef,
   audioRef: { current: HTMLAudioElement | null },
+  setAircraft: Dispatch<SetStateAction<Aircraft[]>>,
   setFeed: Dispatch<SetStateAction<FeedItem[]>>,
   setTrace: Dispatch<SetStateAction<AtcTraceItem[]>>,
   setTalkingAircraftId: Dispatch<SetStateAction<string>>,
@@ -333,36 +436,43 @@ async function runRadioScheduler(
   while (!radioStoppedRef.current) {
     const nextTransmission = radioQueueRef.current.shift();
     if (!nextTransmission) {
-      await wait(250);
+      await waitRadioGap(250, demoSpeedRef, 80);
       continue;
     }
 
     if (isRadioInstructionRequest(nextTransmission)) {
-      await runAgentExchange(nextTransmission, radioStoppedRef, audioRef, setFeed, setTrace, setTalkingAircraftId);
+      if (radioRequestIsStale(nextTransmission, simulationTimeRef)) continue;
+
+      await runAgentExchange(nextTransmission, radioStoppedRef, simulationTimeRef, demoSpeedRef, audioRef, setAircraft, setFeed, setTrace, setTalkingAircraftId);
       continue;
     }
 
-    const stampedTransmission = { ...nextTransmission, time: currentRadioTime() };
+    const stampedTransmission = { ...nextTransmission, time: currentRadioTime(simulationTimeRef.current) };
     setFeed((items) => [stampedTransmission, ...items].slice(0, 80));
 
     if (stampedTransmission.kind === "directive") {
-      await wait(INTERNAL_DIRECTIVE_GAP_MS);
+      await waitRadioGap(INTERNAL_DIRECTIVE_GAP_MS, demoSpeedRef);
       continue;
     }
 
-    await playTransmission(stampedTransmission, audioRef, setTalkingAircraftId);
-    await wait(RADIO_INTER_MESSAGE_GAP_MS);
+    await playTransmission(stampedTransmission, radioStoppedRef, demoSpeedRef, audioRef, setTalkingAircraftId);
+    await waitRadioGap(RADIO_INTER_MESSAGE_GAP_MS, demoSpeedRef);
   }
 }
 
 async function runAgentExchange(
   request: RadioInstructionRequest,
   radioStoppedRef: { current: boolean },
+  simulationTimeRef: SimulationTimeRef,
+  demoSpeedRef: DemoSpeedRef,
   audioRef: { current: HTMLAudioElement | null },
+  setAircraft: Dispatch<SetStateAction<Aircraft[]>>,
   setFeed: Dispatch<SetStateAction<FeedItem[]>>,
   setTrace: Dispatch<SetStateAction<AtcTraceItem[]>>,
   setTalkingAircraftId: Dispatch<SetStateAction<string>>,
 ) {
+  const requestIsCurrent = () => !radioStoppedRef.current && !radioRequestIsStale(request, simulationTimeRef);
+
   emitTrace(
     createTraceItem(
       "Radio Agent",
@@ -371,11 +481,12 @@ async function runAgentExchange(
       `Directive requested for ${request.callsign}`,
       `Heading ${request.heading}; instruction context: ${request.instruction}`,
       "info",
+      simulationTimeRef.current,
     ),
     setTrace,
   );
   const atcResponse = await fetchAtcDirective(request);
-  if (!atcResponse || radioStoppedRef.current) return;
+  if (!atcResponse || !requestIsCurrent()) return;
 
   emitTrace(
     createTraceItem(
@@ -385,17 +496,19 @@ async function runAgentExchange(
       `Directive generated for ${request.callsign}`,
       atcResponse.transmission.text,
       "decision",
+      simulationTimeRef.current,
     ),
     setTrace,
   );
-  emitTransmission(atcResponse.directive, setFeed);
-  await wait(INTERNAL_DIRECTIVE_GAP_MS);
-  if (radioStoppedRef.current) return;
+  emitTransmission(atcResponse.directive, setFeed, simulationTimeRef);
+  await waitRadioGap(INTERNAL_DIRECTIVE_GAP_MS, demoSpeedRef);
+  if (!requestIsCurrent()) return;
 
-  const transmission = emitTransmission(atcResponse.transmission, setFeed);
-  await playTransmission(transmission, audioRef, setTalkingAircraftId);
-  await wait(RADIO_INTER_MESSAGE_GAP_MS);
-  if (radioStoppedRef.current) return;
+  const transmission = emitTransmission(atcResponse.transmission, setFeed, simulationTimeRef);
+  applyAtcInstructionToAircraft(request, transmission, simulationTimeRef.current, setAircraft, setTrace);
+  await playTransmission(transmission, radioStoppedRef, demoSpeedRef, audioRef, setTalkingAircraftId, requestIsCurrent);
+  await waitRadioGap(RADIO_INTER_MESSAGE_GAP_MS, demoSpeedRef);
+  if (!requestIsCurrent()) return;
 
   emitTrace(
     createTraceItem(
@@ -405,25 +518,62 @@ async function runAgentExchange(
       `Readback requested for ${request.callsign}`,
       "The pilot response agent was called after the controller transmission completed.",
       "info",
+      simulationTimeRef.current,
     ),
     setTrace,
   );
   const readback = await fetchPilotReadback(request);
-  if (!readback || radioStoppedRef.current) return;
+  if (!readback || !requestIsCurrent()) return;
 
   emitTrace(
-    createTraceItem("Pilot Readback Agent", "agent.response", request.callsign, `Readback accepted for ${request.callsign}`, readback.text, "decision"),
+    createTraceItem("Pilot Readback Agent", "agent.response", request.callsign, `Readback accepted for ${request.callsign}`, readback.text, "decision", simulationTimeRef.current),
     setTrace,
   );
-  const emittedReadback = emitTransmission(readback, setFeed);
-  await playTransmission(emittedReadback, audioRef, setTalkingAircraftId);
-  await wait(RADIO_INTER_MESSAGE_GAP_MS);
+  const emittedReadback = emitTransmission(readback, setFeed, simulationTimeRef);
+  await playTransmission(emittedReadback, radioStoppedRef, demoSpeedRef, audioRef, setTalkingAircraftId, requestIsCurrent);
+  await waitRadioGap(RADIO_INTER_MESSAGE_GAP_MS, demoSpeedRef);
 }
 
-function emitTransmission(item: FeedItem, setFeed: Dispatch<SetStateAction<FeedItem[]>>) {
-  const stampedTransmission = { ...item, id: item.id || `radio-${feedItemSequence++}`, time: currentRadioTime() };
+function emitTransmission(item: FeedItem, setFeed: Dispatch<SetStateAction<FeedItem[]>>, simulationTimeRef: SimulationTimeRef) {
+  const stampedTransmission = { ...item, id: item.id || `radio-${feedItemSequence++}`, time: currentRadioTime(simulationTimeRef.current) };
   setFeed((items) => [stampedTransmission, ...items].slice(0, 80));
   return stampedTransmission;
+}
+
+function applyAtcInstructionToAircraft(
+  request: RadioInstructionRequest,
+  transmission: FeedItem,
+  activeSeconds: number,
+  setAircraft: Dispatch<SetStateAction<Aircraft[]>>,
+  setTrace: Dispatch<SetStateAction<AtcTraceItem[]>>,
+) {
+  setAircraft((current) => {
+    const result = applySpokenAtcInstruction(current, request, transmission, activeSeconds);
+    if (result.clearance) {
+      const applied = result.clearance;
+      const targets = [
+        applied.heading !== undefined ? `heading ${String(Math.round(applied.heading)).padStart(3, "0")}` : "",
+        applied.altitude !== undefined ? `${applied.altitude}ft` : "",
+        applied.speed !== undefined ? `${applied.speed}kt` : "",
+        applied.phase ? applied.phase : "",
+      ].filter(Boolean);
+
+      emitTrace(
+        createTraceItem(
+          "Flight Director",
+          "clearance.applied",
+          applied.callsign,
+          `${applied.callsign} accepted spoken ATC clearance`,
+          `Parsed "${applied.text}" into ${targets.join(", ")} and updated the aircraft control state.`,
+          "decision",
+          activeSeconds,
+        ),
+        setTrace,
+      );
+    }
+
+    return result.aircraft;
+  });
 }
 
 function emitTrace(item: AtcTraceItem, setTrace: Dispatch<SetStateAction<AtcTraceItem[]>>) {
@@ -451,26 +601,48 @@ async function fetchPilotReadback(request: RadioInstructionRequest) {
   return body.readback;
 }
 
-async function playTransmission(item: FeedItem, audioRef: { current: HTMLAudioElement | null }, setTalkingAircraftId: Dispatch<SetStateAction<string>>) {
+async function playTransmission(
+  item: FeedItem,
+  radioStoppedRef: { current: boolean },
+  demoSpeedRef: DemoSpeedRef,
+  audioRef: { current: HTMLAudioElement | null },
+  setTalkingAircraftId: Dispatch<SetStateAction<string>>,
+  shouldContinue: () => boolean = () => !radioStoppedRef.current,
+) {
   const spokenText = radioPhraseology(item);
+  if (!shouldContinue()) return;
 
   try {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), maxTtsFetchMs(demoSpeedRef.current));
+    const intervalId = window.setInterval(() => {
+      if (!shouldContinue()) controller.abort();
+    }, 100);
     const response = await fetch("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: spokenText, kind: item.kind, voiceProfile: item.voiceProfile }),
+      body: JSON.stringify({ text: spokenText, kind: item.kind, voiceProfile: item.voiceProfile, demoSpeed: demoSpeedRef.current }),
+      signal: controller.signal,
+    }).finally(() => {
+      window.clearTimeout(timeoutId);
+      window.clearInterval(intervalId);
     });
 
+    if (!shouldContinue()) return;
     if (!response.ok) throw new Error("OpenAI TTS request failed");
 
     const blob = await response.blob();
+    if (!shouldContinue()) return;
+
     const url = URL.createObjectURL(blob);
     setTalkingAircraftId(item.kind === "readback" ? item.callsign : "");
-    await playAudioUrl(url, audioRef);
+    await playAudioUrl(url, audioRef, radioPlaybackRate(demoSpeedRef.current), maxRadioPlaybackMs(demoSpeedRef.current), shouldContinue);
     URL.revokeObjectURL(url);
   } catch {
+    if (!shouldContinue()) return;
+
     setTalkingAircraftId(item.kind === "readback" ? item.callsign : "");
-    await speakTransmissionFallback(item);
+    await speakTransmissionFallback(item, demoSpeedRef, shouldContinue);
   } finally {
     setTalkingAircraftId("");
   }
@@ -483,41 +655,86 @@ function radioPhraseology(item: FeedItem) {
   return item.text;
 }
 
-function playAudioUrl(url: string, audioRef: { current: HTMLAudioElement | null }) {
+function playAudioUrl(
+  url: string,
+  audioRef: { current: HTMLAudioElement | null },
+  playbackRate: number,
+  maxPlaybackMs: number,
+  shouldContinue: () => boolean,
+) {
   return new Promise<void>((resolve) => {
     const audio = new Audio(url);
+    let settled = false;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeoutId);
+      window.clearInterval(intervalId);
+      audio.onended = null;
+      audio.onerror = null;
+      audio.pause();
+      resolve();
+    };
+
+    audioRef.current?.pause();
     audioRef.current = audio;
-    audio.onended = () => resolve();
-    audio.onerror = () => resolve();
-    audio.play().catch(() => resolve());
+    audio.playbackRate = playbackRate;
+    audio.onended = finish;
+    audio.onerror = finish;
+    const timeoutId = window.setTimeout(finish, maxPlaybackMs);
+    const intervalId = window.setInterval(() => {
+      if (!shouldContinue()) finish();
+    }, 100);
+    audio.play().catch(finish);
   });
 }
 
-function speakTransmissionFallback(item: FeedItem) {
+function speakTransmissionFallback(item: FeedItem, demoSpeedRef: DemoSpeedRef, shouldContinue: () => boolean) {
   return new Promise<void>((resolve) => {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) {
       resolve();
       return;
     }
 
+    if (!shouldContinue()) {
+      resolve();
+      return;
+    }
+
     const utterance = new SpeechSynthesisUtterance(radioPhraseology(item));
-    utterance.rate = item.kind === "readback" ? 1.22 : item.kind === "instruction" ? 1.16 : 1.08;
+    const speechRate = item.kind === "readback" ? 1.22 : item.kind === "instruction" ? 1.16 : 1.08;
+    let settled = false;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeoutId);
+      window.clearInterval(intervalId);
+      resolve();
+    };
+
+    utterance.rate = Math.min(4, speechRate * radioPlaybackRate(demoSpeedRef.current));
     utterance.pitch = item.kind === "readback" ? 1.05 : 0.9;
     utterance.volume = 0.85;
-    utterance.onend = () => resolve();
-    utterance.onerror = () => resolve();
+    utterance.onend = finish;
+    utterance.onerror = finish;
+    const timeoutId = window.setTimeout(() => {
+      window.speechSynthesis.cancel();
+      finish();
+    }, maxRadioPlaybackMs(demoSpeedRef.current));
+    const intervalId = window.setInterval(() => {
+      if (!shouldContinue()) {
+        window.speechSynthesis.cancel();
+        finish();
+      }
+    }, 100);
     window.speechSynthesis.speak(utterance);
   });
 }
 
-function currentRadioTime() {
-  return new Date().toLocaleTimeString("en-AU", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-    timeZone: "Australia/Sydney",
-  });
+function currentRadioTime(elapsedSeconds = 0) {
+  return formatSimulationClock(elapsedSeconds);
 }
 
 function createTraceItem(
@@ -527,10 +744,11 @@ function createTraceItem(
   summary: string,
   detail: string,
   level: AtcTraceItem["level"],
+  elapsedSeconds = 0,
 ): AtcTraceItem {
   return {
     id: `trace-${Date.now()}-${feedItemSequence++}-${action}`,
-    time: currentRadioTime(),
+    time: currentRadioTime(elapsedSeconds),
     agent,
     action,
     target,
@@ -544,8 +762,55 @@ function wait(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function waitRadioGap(ms: number, demoSpeedRef: DemoSpeedRef, minimumMs = 35) {
+  return wait(Math.max(minimumMs, Math.round(ms / Math.max(1, demoSpeedRef.current))));
+}
+
+function radioPlaybackRate(speed: DemoSpeed) {
+  if (speed <= 1) return 1;
+  return Math.min(4, 1 + Math.log2(speed) * 0.7);
+}
+
+function maxRadioPlaybackMs(speed: DemoSpeed) {
+  if (speed >= 30) return 800;
+  if (speed >= 15) return 1200;
+  if (speed >= 5) return 3200;
+  return 12000;
+}
+
+function maxTtsFetchMs(speed: DemoSpeed) {
+  if (speed >= 30) return 900;
+  if (speed >= 15) return 1200;
+  if (speed >= 5) return 2600;
+  return 10000;
+}
+
+function pruneRadioQueue(queue: RadioQueueItem[], activeTick: number) {
+  const fresh = queue.filter((item) => !isRadioInstructionRequest(item) || activeTick - (item.issuedAt ?? activeTick) <= RADIO_STALE_SECONDS);
+  if (fresh.length <= MAX_RADIO_QUEUE_ITEMS) return fresh;
+
+  const urgent = fresh.filter(isRunwayClearanceRequest).slice(0, MAX_RADIO_QUEUE_ITEMS);
+  const regularSlots = MAX_RADIO_QUEUE_ITEMS - urgent.length;
+  const regular = regularSlots > 0 ? fresh.filter((item) => !isRunwayClearanceRequest(item)).slice(-regularSlots) : [];
+  return [...urgent, ...regular];
+}
+
+function enqueueRadioEvents(queue: RadioQueueItem[], events: RadioQueueItem[], activeTick: number) {
+  const urgent = events.filter(isRunwayClearanceRequest);
+  const normal = events.filter((item) => !isRunwayClearanceRequest(item));
+  return pruneRadioQueue([...urgent, ...queue, ...normal], activeTick);
+}
+
+function radioRequestIsStale(request: RadioInstructionRequest, simulationTimeRef: SimulationTimeRef) {
+  return simulationTimeRef.current - (request.issuedAt ?? simulationTimeRef.current) > RADIO_STALE_SECONDS;
+}
+
 function isRadioInstructionRequest(item: RadioQueueItem): item is RadioInstructionRequest {
   return "type" in item && item.type === "agentExchange";
+}
+
+function isRunwayClearanceRequest(item: RadioQueueItem): item is RadioInstructionRequest {
+  return isRadioInstructionRequest(item) && (item.heading === "CLEARED TAKEOFF" || item.heading === "CLEARED TO LAND");
 }
 
 function phaseHeading(ac: Aircraft) {

@@ -17,7 +17,7 @@ export type Phase =
   | "outbound"
   | "departed";
 export type WakeCategory = "medium" | "heavy";
-export type AppView = "radar" | "channel" | "trace";
+export type AppView = "radar" | "channel";
 
 export type Point = {
   x: number;
@@ -51,6 +51,11 @@ export type Aircraft = {
   slot: string;
   instruction: string;
   reason: string;
+  clearedHeading?: number;
+  clearedAltitude?: number;
+  clearedSpeed?: number;
+  lastAtcInstruction?: string;
+  lastAtcInstructionAt?: number;
   trail: Point[];
 };
 
@@ -73,6 +78,7 @@ export type RadioInstructionRequest = {
   heading: string;
   instruction: string;
   mode: ControlMode;
+  issuedAt?: number;
 };
 
 export type AtcPlanAssignment = {

@@ -1,4 +1,5 @@
-import { makeSlot } from "@/lib/simulation";
+import { formatSimulationClock, makeSlot } from "@/lib/simulation";
+import { assessTrafficState, describeSupervisorDecision, runLlmSupervisor, supervisorAssessmentTrace, type SupervisorAssessment } from "@/lib/server/atc-supervisor";
 import type { Aircraft, AtcPlanAssignment, AtcTraceItem, ControlMode, Phase, Point } from "@/types/atc";
 
 const RUNWAY_THRESHOLD = { x: 63.3, y: 69.0 };
@@ -40,11 +41,18 @@ export function planArrivals(aircraft: Aircraft[], mode: ControlMode): AtcPlanAs
   return planArrivalsWithTrace(aircraft, mode).assignments;
 }
 
+export async function planArrivalsWithLlmSupervisor(aircraft: Aircraft[], mode: ControlMode): Promise<AtcPlanResult> {
+  const planned = planArrivalsWithTrace(aircraft, mode);
+  return runLlmSupervisor(aircraft, mode, planned.assignments, planned.trace);
+}
+
 export function planArrivalsWithTrace(aircraft: Aircraft[], mode: ControlMode): AtcPlanResult {
   const trace: AtcTraceItem[] = [];
   addTrace(trace, "Supervisor Agent", "plan.start", "YSSY", `Planning ${aircraft.length} tracks`, "Loaded normalized track state and selected the planning pipeline.", "info");
+  const assessment = assessTrafficState(aircraft);
+  trace.push(supervisorAssessmentTrace(assessment));
 
-  if (aircraft.length >= 50) return planPeakTraffic(aircraft, mode, trace);
+  if (aircraft.length >= 50) return planPeakTraffic(aircraft, mode, trace, assessment);
 
   const ranked = aircraft
     .filter((ac) => ac.phase !== "landed" && ac.phase !== "departed")
@@ -76,7 +84,7 @@ export function planArrivalsWithTrace(aircraft: Aircraft[], mode: ControlMode): 
       heading: headingTo(ac, vectorPlan.target),
       altitude: vectorPlan.altitude,
       speed: vectorPlan.speed,
-      ...instructionFor(ac, sequence, delay, mode, vectorPlan),
+      ...instructionFor(ac, sequence, delay, mode, vectorPlan, assessment),
     };
   });
 
@@ -92,7 +100,7 @@ export function planArrivalsWithTrace(aircraft: Aircraft[], mode: ControlMode): 
   return { assignments, trace };
 }
 
-function planPeakTraffic(aircraft: Aircraft[], mode: ControlMode, trace: AtcTraceItem[] = []): AtcPlanResult {
+function planPeakTraffic(aircraft: Aircraft[], mode: ControlMode, trace: AtcTraceItem[] = [], assessment = assessTrafficState(aircraft)): AtcPlanResult {
   const active = aircraft
     .filter((ac) => ac.phase !== "landed" && ac.phase !== "departed")
     .slice();
@@ -134,7 +142,7 @@ function planPeakTraffic(aircraft: Aircraft[], mode: ControlMode, trace: AtcTrac
       heading: headingTo(item.ac, vectorPlan.target),
       altitude: vectorPlan.altitude,
       speed: vectorPlan.speed,
-      ...instructionFor(item.ac, item.sequence, delay, mode, vectorPlan),
+      ...instructionFor(item.ac, item.sequence, delay, mode, vectorPlan, assessment),
     };
   });
 
@@ -373,6 +381,36 @@ export function calculateVectorOptions(ac: Aircraft, mode: ControlMode): VectorO
   const baseDescentAltitude = Math.max(3000, Math.round((ac.altitude - 2200) / 500) * 500);
   const normalSpeed = ac.wake === "heavy" ? 240 : 230;
 
+  if (ac.phase === "final") {
+    return [
+      {
+        name: "continue established final",
+        assignedPhase: "final",
+        routeLeg: 6,
+        target: RUNWAY_THRESHOLD,
+        speed: Math.max(145, normalSpeed - 65),
+        altitude: Math.max(1800, Math.min(3000, baseDescentAltitude)),
+        delaySeconds: 0,
+        trackMiles: distance(ac, RUNWAY_THRESHOLD),
+      },
+    ];
+  }
+
+  if (ac.phase === "base") {
+    return [
+      {
+        name: "continue base to final",
+        assignedPhase: "base",
+        routeLeg: 5,
+        target: MERGE_POINT,
+        speed: Math.max(175, normalSpeed - 45),
+        altitude: Math.max(3000, Math.min(5000, baseDescentAltitude)),
+        delaySeconds: 45,
+        trackMiles: distance(ac, MERGE_POINT),
+      },
+    ];
+  }
+
   if (mode !== "ai") {
     return [
       {
@@ -490,7 +528,9 @@ function chooseVectorPlan(ac: Aircraft, runwayTime: number, etaScore: number, mo
     .sort((a, b) => a.cost - b.cost)[0].option;
 }
 
-function instructionFor(ac: Aircraft, sequence: number, delay: number, mode: ControlMode, vectorPlan: VectorOption) {
+function instructionFor(ac: Aircraft, sequence: number, delay: number, mode: ControlMode, vectorPlan: VectorOption, assessment: SupervisorAssessment) {
+  const supervisorReason = describeSupervisorDecision(ac, sequence, delay, mode, vectorPlan, assessment);
+
   if (ac.operation === "departure") {
     const instruction =
       vectorPlan.assignedPhase === "departure"
@@ -498,28 +538,56 @@ function instructionFor(ac: Aircraft, sequence: number, delay: number, mode: Con
         : `${ac.callsign}, fly runway heading, climb ${vectorPlan.altitude}ft, contact departures airborne`;
     return {
       instruction,
-      reason: `Supervisor Agent sequenced departure into the shared channel; selected ${vectorPlan.name} with ${Math.round(delay)}s slot pressure`,
+      reason: supervisorReason || `Traditional coordinator sequenced departure into the shared channel; selected ${vectorPlan.name} with ${Math.round(delay)}s slot pressure`,
     };
   }
 
   if (ac.phase === "scheduled") {
     return {
       instruction: `${ac.callsign}, expect runway three four left, sequence ${sequence}, cross the arrival gate at ${vectorPlan.altitude}ft and ${vectorPlan.speed}kt`,
-      reason: `Supervisor Agent planned before sector entry using release time ${ac.releaseAt}s and ${vectorPlan.name}`,
+      reason: supervisorReason || `Traditional coordinator planned before sector entry using release time ${ac.releaseAt}s and ${vectorPlan.name}`,
     };
   }
 
   if (mode === "ai") {
+    if (vectorPlan.assignedPhase === "final") {
+      return {
+        instruction: `${ac.callsign}, cleared ILS three four left, maintain ${vectorPlan.speed}kt to four mile final`,
+        reason: supervisorReason,
+      };
+    }
+
+    if (vectorPlan.assignedPhase === "base") {
+      return {
+        instruction: `${ac.callsign}, turn base, descend ${vectorPlan.altitude}ft, reduce ${vectorPlan.speed}kt, cleared ILS three four left, sequence ${sequence}`,
+        reason: supervisorReason,
+      };
+    }
+
     const heading = String(headingTo(ac, vectorPlan.target)).padStart(3, "0");
     const instruction = `${ac.callsign}, turn heading ${heading}, descend ${vectorPlan.altitude}ft, reduce ${vectorPlan.speed}kt, runway three four left, sequence ${sequence}`;
 
     return {
       instruction,
-      reason: `Supervisor Agent function call selected ${vectorPlan.name}; ETA, wake spacing, altitude, speed, and slot delay ${Math.round(delay)}s minimized total vector cost`,
+      reason: supervisorReason,
     };
   }
 
   const heading = String(headingTo(ac, vectorPlan.target)).padStart(3, "0");
+  if (vectorPlan.assignedPhase === "final") {
+    return {
+      instruction: `${ac.callsign}, cleared ILS three four left, maintain ${vectorPlan.speed}kt`,
+      reason: `Traditional coordinator kept established final and accepted the slot pressure`,
+    };
+  }
+
+  if (vectorPlan.assignedPhase === "base") {
+    return {
+      instruction: `${ac.callsign}, turn base, descend ${vectorPlan.altitude}ft, reduce ${vectorPlan.speed}kt, vectors ILS three four left, sequence ${sequence}`,
+      reason: `Traditional coordinator kept aircraft on base rather than breaking it back out for spacing`,
+    };
+  }
+
   return {
     instruction:
       delay > 180
@@ -549,13 +617,7 @@ function addTrace(
 ) {
   trace.push({
     id: `${trace.length + 1}-${action}-${target}`.replaceAll(/\s+/g, "-").toLowerCase(),
-    time: new Date().toLocaleTimeString("en-AU", {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: false,
-      timeZone: "Australia/Sydney",
-    }),
+    time: formatSimulationClock(0),
     agent,
     action,
     target,

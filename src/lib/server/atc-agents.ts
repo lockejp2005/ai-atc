@@ -18,7 +18,7 @@ export function buildAtcAgentResponse(request: RadioInstructionRequest): AtcAgen
       from: supervisor,
       to: controller,
       heading: "DIRECTIVE",
-      text: `Math check complete. Issue ${request.heading.toLowerCase()} now, keep the readback short, and monitor for spacing drift: ${request.instruction}`,
+      text: `Issue ${request.heading.toLowerCase()} for the current sim-time sequence and keep the readback short: ${request.instruction}`,
       kind: "directive",
     },
     transmission: {
@@ -73,6 +73,7 @@ export function validateRadioInstructionRequest(value: unknown): RadioInstructio
     heading: candidate.heading,
     instruction: candidate.instruction,
     mode: candidate.mode,
+    issuedAt: typeof candidate.issuedAt === "number" ? candidate.issuedAt : undefined,
   };
 }
 

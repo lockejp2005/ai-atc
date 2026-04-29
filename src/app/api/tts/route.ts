@@ -8,6 +8,7 @@ type TtsRequest = {
   text?: string;
   kind?: keyof typeof VOICE_BY_KIND;
   voiceProfile?: string;
+  demoSpeed?: number;
 };
 
 export async function POST(request: Request) {
@@ -23,6 +24,7 @@ export async function POST(request: Request) {
   }
 
   const kind = body.kind && body.kind in VOICE_BY_KIND ? body.kind : "instruction";
+  const speechSpeed = ttsSpeechSpeed(kind, body.demoSpeed);
   const response = await fetch("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: {
@@ -34,7 +36,7 @@ export async function POST(request: Request) {
       voice: VOICE_BY_KIND[kind],
       input: text,
       instructions: voiceInstructions(kind, body.voiceProfile),
-      speed: kind === "readback" ? 1.22 : kind === "instruction" ? 1.16 : 1.08,
+      speed: speechSpeed,
       response_format: "mp3",
     }),
   });
@@ -50,6 +52,13 @@ export async function POST(request: Request) {
       "Cache-Control": "no-store",
     },
   });
+}
+
+function ttsSpeechSpeed(kind: keyof typeof VOICE_BY_KIND, demoSpeed?: number) {
+  const baseSpeed = kind === "readback" ? 1.22 : kind === "instruction" ? 1.16 : 1.08;
+  const speed = typeof demoSpeed === "number" && Number.isFinite(demoSpeed) ? demoSpeed : 1;
+  const multiplier = speed <= 1 ? 1 : 1 + Math.log2(speed) * 0.35;
+  return Math.min(4, Number((baseSpeed * multiplier).toFixed(2)));
 }
 
 function voiceInstructions(kind: keyof typeof VOICE_BY_KIND, voiceProfile?: string) {

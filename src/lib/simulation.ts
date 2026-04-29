@@ -38,16 +38,37 @@ const PEAK_ARRIVAL_RELEASE_START_SECONDS = 240;
 const PEAK_ARRIVAL_RELEASE_INTERVAL_SECONDS = 105;
 const PEAK_DEPARTURE_RELEASE_START_SECONDS = 120;
 const PEAK_DEPARTURE_RELEASE_INTERVAL_SECONDS = 150;
+const SIMULATION_START_ISO = "2026-04-29T14:00:00+10:00";
+const SIMULATION_TIME_ZONE = "Australia/Sydney";
+const SIMULATION_START_SECONDS = 14 * 60 * 60;
+const ARRIVAL_RUNWAY_CLEAR_SECONDS = 60;
+const DEPARTURE_RADAR_CLEAR_SECONDS = 600;
+const SPOKEN_VECTOR_SECONDS = 90;
 
 export function makeSlot(index: number, spacingSeconds = 300) {
-  const base = new Date("2026-04-29T14:00:00+10:00");
-  base.setSeconds(base.getSeconds() + index * spacingSeconds);
-  return base.toLocaleTimeString("en-AU", {
+  return formatSimulationClock(index * spacingSeconds);
+}
+
+export function formatSimulationClock(elapsedSeconds: number) {
+  const time = new Date(SIMULATION_START_ISO);
+  time.setSeconds(time.getSeconds() + Math.max(0, Math.round(elapsedSeconds)));
+
+  return time.toLocaleTimeString("en-AU", {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
+    timeZone: SIMULATION_TIME_ZONE,
   });
+}
+
+export function simulationSecondsFromSlot(slot: string) {
+  const parts = slot.split(":").map(Number);
+  if (parts.length !== 3 || parts.some(Number.isNaN)) return null;
+
+  const slotSeconds = parts[0] * 60 * 60 + parts[1] * 60 + parts[2];
+  const elapsedSeconds = slotSeconds - SIMULATION_START_SECONDS;
+  return elapsedSeconds < 0 ? elapsedSeconds + 24 * 60 * 60 : elapsedSeconds;
 }
 
 export function commandFor(ac: Aircraft, mode: ControlMode) {
@@ -276,6 +297,11 @@ function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
 }
 
+function moveToward(value: number, target: number, step: number) {
+  if (value < target) return Math.min(target, value + step);
+  return Math.max(target, value - step);
+}
+
 function laneOffset(ac: Aircraft) {
   return ((ac.sequence * 7) % 9) - 4;
 }
@@ -429,6 +455,8 @@ export function moveAircraft(ac: Aircraft, mode: ControlMode, elapsedSeconds = 5
 }
 
 export function moveAircraftAt(ac: Aircraft, mode: ControlMode, elapsedSeconds = 5, activeSeconds = 0): Aircraft {
+  if (ac.phase === "landed" || ac.phase === "departed") return ac;
+
   if (ac.phase === "scheduled") {
     if (activeSeconds < ac.releaseAt) return ac;
 
@@ -441,95 +469,245 @@ export function moveAircraftAt(ac: Aircraft, mode: ControlMode, elapsedSeconds =
     return { ...activated, ...commandFor(activated, mode) };
   }
 
-  const holdingPattern = ac.phase === "holding" ? holdingPatternFor(ac, elapsedSeconds) : null;
+  if (ac.operation === "arrival") return projectArrivalAtSlot(ac, mode, elapsedSeconds, activeSeconds);
+  return projectDepartureAtSlot(ac, mode, elapsedSeconds, activeSeconds);
+}
+
+function projectArrivalAtSlot(ac: Aircraft, mode: ControlMode, elapsedSeconds: number, activeSeconds: number): Aircraft {
   const route = routeWaypointsFor(ac, mode);
-  const routeLeg = Math.min(ac.routeLeg, route.length - 1);
-  const routeTarget = holdingPattern ?? route[routeLeg];
+  const slotSeconds = simulationSecondsFromSlot(ac.slot);
+  if (slotSeconds === null) return projectAircraftIncrementally(ac, mode, elapsedSeconds);
 
-  const dx = routeTarget.x - ac.x;
-  const dy = routeTarget.y - ac.y;
-  const distance = Math.hypot(dx, dy);
-  const simStep = Math.max(0.2, elapsedSeconds / 5);
-  const step = (ac.phase === "holding" ? 0.05 : ac.operation === "departure" ? 0.42 : mode === "ai" ? 0.34 : 0.27) * simStep;
-  const desiredHeading = Math.atan2(dx, -dy) * (180 / Math.PI);
-  const heading = holdingPattern?.heading ?? turnToward(ac.heading, desiredHeading < 0 ? desiredHeading + 360 : desiredHeading, 11 * simStep);
-  const headingRad = (heading * Math.PI) / 180;
-  const nextX = holdingPattern ? holdingPattern.x : ac.x + Math.sin(headingRad) * Math.min(step, distance);
-  const nextY = holdingPattern ? holdingPattern.y : ac.y - Math.cos(headingRad) * Math.min(step, distance);
-
-  let phase: Phase = ac.phase as Phase;
-  let nextRouteLeg = routeLeg;
-  if (!holdingPattern && distance < 1.2 && routeLeg < route.length - 1) {
-    nextRouteLeg = routeLeg + 1;
-    phase = route[nextRouteLeg].phase;
-  }
-  const holdReleaseSeconds = mode === "ai" ? 180 + (ac.sequence % 6) * 35 : 260 + ac.sequence * 8;
-  if (phase === "holding" && ac.holding > holdReleaseSeconds) {
-    phase = "vectoring";
-    nextRouteLeg = Math.max(routeLeg, routeLegForPhase("vectoring"));
+  const landed = activeSeconds >= slotSeconds + ARRIVAL_RUNWAY_CLEAR_SECONDS;
+  const secondsToSlot = slotSeconds - activeSeconds;
+  if (ac.releasePhase === "holding" && activeSeconds < slotSeconds - 900) {
+    const holdPoint = holdingPatternFor(ac, activeSeconds);
+    const phase: Phase = "holding";
+    const fuelBurn = (fuelBurnRateKgPerMinute({ ...ac, phase }, mode) * elapsedSeconds) / 60;
+    const updated = {
+      ...ac,
+      ...holdPoint,
+      phase,
+      routeLeg: 1,
+      delay: ac.delay,
+      holding: ac.holding + elapsedSeconds,
+      fuel: Math.max(300, ac.fuel - fuelBurn),
+      altitude: 9000,
+      speed: 210,
+      trail: [...ac.trail.slice(-24), { x: holdPoint.x, y: holdPoint.y }],
+    };
+    return { ...updated, ...commandFor(updated, mode) };
   }
 
-  const altitudeTarget =
-    phase === "departed"
-      ? 15000
-      : phase === "outbound"
-        ? 13000
-        : phase === "climb"
-          ? 9000
-          : phase === "takeoff"
-            ? 3500
-            : phase === "departure"
-              ? 0
-              : phase === "final"
-                ? Math.max(500, Math.round(distance * 450))
-                : phase === "base"
-                  ? 5000
-                  : phase === "downwind"
-                    ? 7000
-                    : 9000;
-  const speedTarget =
-    phase === "departure"
-      ? 0
-      : phase === "takeoff"
-        ? 165
-        : phase === "climb" || phase === "outbound"
-          ? mode === "ai"
-            ? 265
-            : 245
-          : phase === "final"
-            ? 155
-            : mode === "ai"
-              ? 230
-              : phase === "holding"
-                ? 210
-                : 250;
-  const delayChangePerSecond = (mode === "traditional" ? 0.6 : -0.8) + (phase === "holding" ? 1.25 : 0);
-  const delay = Math.max(0, ac.delay + elapsedSeconds * delayChangePerSecond);
-  const holding = phase === "holding" ? ac.holding + elapsedSeconds : ac.holding;
-  const trail = [...ac.trail.slice(-24), { x: nextX, y: nextY }];
-  const fuelBurn = (fuelBurnRateKgPerMinute({ ...ac, phase }, mode) * elapsedSeconds) / 60;
+  if (shouldFlySpokenVector(ac, activeSeconds, secondsToSlot)) {
+    return projectArrivalOnSpokenClearance(ac, mode, elapsedSeconds);
+  }
+
+  const routeStartSeconds = ac.releasePhase === "holding" ? Math.max(ac.releaseAt, slotSeconds - 900) : ac.releaseAt;
+  const activeRouteTime = Math.max(90, slotSeconds - routeStartSeconds);
+  const progress = activeSeconds >= slotSeconds ? 1 : clamp((activeSeconds - routeStartSeconds) / activeRouteTime, 0, 1);
+  const projected = interpolateRoute(route, timelineStartLegForArrival(ac.releasePhase), progress);
+  const phase = landed ? "landed" : arrivalPhaseForSchedule(projected.phase, secondsToSlot);
+  const trail = landed ? ac.trail : [...ac.trail.slice(-24), { x: projected.x, y: projected.y }];
+  const fuelBurn = landed ? 0 : (fuelBurnRateKgPerMinute({ ...ac, phase }, mode) * elapsedSeconds) / 60;
   const updated = {
     ...ac,
-    x: nextX,
-    y: nextY,
+    x: projected.x,
+    y: projected.y,
     phase,
-    routeLeg: nextRouteLeg,
-    delay,
-    holding,
+    routeLeg: projected.routeLeg,
+    delay: ac.delay,
+    holding: phase === "holding" ? ac.holding + elapsedSeconds : ac.holding,
     fuel: Math.max(300, ac.fuel - fuelBurn),
-    altitude: Math.round(ac.altitude + (altitudeTarget - ac.altitude) * 0.08),
-    speed: Math.round(ac.speed + (speedTarget - ac.speed) * 0.08),
-    heading: heading < 0 ? heading + 360 : heading,
+    altitude: activeClearanceValue(ac.clearedAltitude, ac.lastAtcInstructionAt, activeSeconds) ?? altitudeForArrivalPhase(phase, secondsToSlot),
+    speed: activeClearanceValue(ac.clearedSpeed, ac.lastAtcInstructionAt, activeSeconds) ?? speedForArrivalPhase(phase, ac.wake),
+    heading: activeClearanceValue(ac.clearedHeading, ac.lastAtcInstructionAt, activeSeconds) ?? projected.heading,
     trail,
   };
 
+  return phase === "landed" ? updated : { ...updated, ...commandFor(updated, mode) };
+}
+
+function projectDepartureAtSlot(ac: Aircraft, mode: ControlMode, elapsedSeconds: number, activeSeconds: number): Aircraft {
+  const route = routeWaypointsFor(ac, mode);
+  const slotSeconds = simulationSecondsFromSlot(ac.slot) ?? ac.releaseAt;
+  const elapsedSinceSlot = activeSeconds - slotSeconds;
+  const departed = elapsedSinceSlot >= DEPARTURE_RADAR_CLEAR_SECONDS;
+  const progress = clamp(elapsedSinceSlot / DEPARTURE_RADAR_CLEAR_SECONDS, 0, 1);
+  const projected = interpolateRoute(route, 0, progress);
+  const phase = departed ? "departed" : departurePhaseForSchedule(elapsedSinceSlot);
+  const trail = departed ? ac.trail : [...ac.trail.slice(-24), { x: projected.x, y: projected.y }];
+  const fuelBurn = departed ? 0 : (fuelBurnRateKgPerMinute({ ...ac, phase }, mode) * elapsedSeconds) / 60;
+  const updated = {
+    ...ac,
+    x: projected.x,
+    y: projected.y,
+    phase,
+    routeLeg: projected.routeLeg,
+    delay: ac.delay,
+    fuel: Math.max(300, ac.fuel - fuelBurn),
+    altitude: activeClearanceValue(ac.clearedAltitude, ac.lastAtcInstructionAt, activeSeconds) ?? altitudeForDeparturePhase(phase),
+    speed: activeClearanceValue(ac.clearedSpeed, ac.lastAtcInstructionAt, activeSeconds) ?? speedForDeparturePhase(phase, mode),
+    heading: activeClearanceValue(ac.clearedHeading, ac.lastAtcInstructionAt, activeSeconds) ?? projected.heading,
+    trail,
+  };
+
+  return phase === "departed" ? updated : { ...updated, ...commandFor(updated, mode) };
+}
+
+function shouldFlySpokenVector(ac: Aircraft, activeSeconds: number, secondsToSlot: number) {
+  if (ac.operation !== "arrival" || ac.clearedHeading === undefined || ac.lastAtcInstructionAt === undefined) return false;
+  if (ac.phase === "final" || ac.phase === "base" || secondsToSlot <= 420) return false;
+  return activeSeconds - ac.lastAtcInstructionAt <= SPOKEN_VECTOR_SECONDS;
+}
+
+function projectArrivalOnSpokenClearance(ac: Aircraft, mode: ControlMode, elapsedSeconds: number): Aircraft {
+  const heading = ac.clearedHeading ?? ac.heading;
+  const headingRad = (heading * Math.PI) / 180;
+  const speed = moveToward(ac.speed, ac.clearedSpeed ?? ac.speed, Math.max(4, elapsedSeconds * 1.8));
+  const altitude = moveToward(ac.altitude, ac.clearedAltitude ?? ac.altitude, Math.max(150, elapsedSeconds * 220));
+  const step = (mode === "ai" ? 0.36 : 0.29) * Math.max(0.2, elapsedSeconds / 5);
+  const x = clamp(ac.x + Math.sin(headingRad) * step, 4, 92);
+  const y = clamp(ac.y - Math.cos(headingRad) * step, 4, 94);
+  const phase = ac.phase === "scheduled" ? ac.releasePhase : ac.phase;
+  const fuelBurn = (fuelBurnRateKgPerMinute({ ...ac, phase }, mode) * elapsedSeconds) / 60;
+  const updated = {
+    ...ac,
+    x,
+    y,
+    phase,
+    altitude,
+    speed,
+    heading,
+    fuel: Math.max(300, ac.fuel - fuelBurn),
+    trail: [...ac.trail.slice(-24), { x, y }],
+  };
+  const command = commandFor(updated, mode);
+  return { ...updated, ...command, instruction: ac.lastAtcInstruction ?? command.instruction };
+}
+
+function activeClearanceValue(value: number | undefined, issuedAt: number | undefined, activeSeconds: number) {
+  if (value === undefined || issuedAt === undefined) return undefined;
+  return activeSeconds - issuedAt <= SPOKEN_VECTOR_SECONDS * 2 ? value : undefined;
+}
+
+function interpolateRoute(route: RouteWaypoint[], startLeg: number, progress: number) {
+  const firstLeg = clamp(Math.min(startLeg, route.length - 2), 0, route.length - 2);
+  const segments = route
+    .slice(firstLeg)
+    .map((point, index, points) => {
+      const next = points[index + 1];
+      return next ? { from: point, to: next, length: Math.hypot(next.x - point.x, next.y - point.y) } : null;
+    })
+    .filter((segment): segment is { from: RouteWaypoint; to: RouteWaypoint; length: number } => segment !== null);
+  const totalLength = segments.reduce((sum, segment) => sum + segment.length, 0);
+  let remaining = totalLength * clamp(progress, 0, 1);
+
+  for (let index = 0; index < segments.length; index++) {
+    const segment = segments[index];
+    if (remaining <= segment.length || index === segments.length - 1) {
+      const legProgress = segment.length ? clamp(remaining / segment.length, 0, 1) : 1;
+      const x = segment.from.x + (segment.to.x - segment.from.x) * legProgress;
+      const y = segment.from.y + (segment.to.y - segment.from.y) * legProgress;
+      return {
+        x,
+        y,
+        heading: headingBetween(segment.from, segment.to),
+        phase: segment.to.phase,
+        routeLeg: firstLeg + index,
+      };
+    }
+    remaining -= segment.length;
+  }
+
+  const last = route.at(-1) ?? route[0];
+  return { x: last.x, y: last.y, heading: 335, phase: last.phase, routeLeg: route.length - 1 };
+}
+
+function projectAircraftIncrementally(ac: Aircraft, mode: ControlMode, elapsedSeconds: number): Aircraft {
+  const route = routeWaypointsFor(ac, mode);
+  const routeLeg = Math.min(ac.routeLeg, route.length - 1);
+  const target = route[routeLeg];
+  const distance = Math.hypot(target.x - ac.x, target.y - ac.y);
+  const heading = headingBetween(ac, target);
+  const step = (mode === "ai" ? 0.34 : 0.27) * Math.max(0.2, elapsedSeconds / 5);
+  const headingRad = (heading * Math.PI) / 180;
+  const x = ac.x + Math.sin(headingRad) * Math.min(step, distance);
+  const y = ac.y - Math.cos(headingRad) * Math.min(step, distance);
+  const routeDone = distance < 1.2 && routeLeg < route.length - 1;
+  const phase = routeDone ? route[routeLeg + 1].phase : ac.phase;
+  const updated = {
+    ...ac,
+    x,
+    y,
+    phase,
+    routeLeg: routeDone ? routeLeg + 1 : routeLeg,
+    heading,
+    trail: [...ac.trail.slice(-24), { x, y }],
+  };
   return { ...updated, ...commandFor(updated, mode) };
 }
 
-function turnToward(current: number, target: number, maxTurn: number) {
-  const delta = ((((target - current) % 360) + 540) % 360) - 180;
-  const turn = Math.max(-maxTurn, Math.min(maxTurn, delta));
-  return (current + turn + 360) % 360;
+function timelineStartLegForArrival(phase: Aircraft["releasePhase"]) {
+  if (phase === "final") return 5;
+  if (phase === "base") return 4;
+  if (phase === "downwind") return 3;
+  if (phase === "vectoring") return 2;
+  return 0;
+}
+
+function arrivalPhaseForSchedule(routePhase: Phase, secondsToSlot: number): Phase {
+  if (secondsToSlot <= 300) return "final";
+  if (secondsToSlot <= 480) return "base";
+  if (secondsToSlot <= 720) return "downwind";
+  if (routePhase === "arrival" || routePhase === "vectoring" || routePhase === "downwind" || routePhase === "base" || routePhase === "final") return routePhase;
+  return "arrival";
+}
+
+function departurePhaseForSchedule(elapsedSinceSlot: number): Phase {
+  if (elapsedSinceSlot < 0) return "departure";
+  if (elapsedSinceSlot < 60) return "takeoff";
+  if (elapsedSinceSlot < 240) return "climb";
+  return "outbound";
+}
+
+function altitudeForArrivalPhase(phase: Phase, secondsToSlot: number) {
+  if (phase === "landed") return 0;
+  if (phase === "final") return Math.max(500, Math.round(500 + clamp(secondsToSlot / 300, 0, 1) * 2500));
+  if (phase === "base") return 4500;
+  if (phase === "downwind") return 7000;
+  if (phase === "vectoring") return 9000;
+  return 12000;
+}
+
+function speedForArrivalPhase(phase: Phase, wake: WakeCategory) {
+  const heavyAdjustment = wake === "heavy" ? 10 : 0;
+  if (phase === "landed") return 0;
+  if (phase === "final") return 155 + heavyAdjustment;
+  if (phase === "base") return 185 + heavyAdjustment;
+  if (phase === "downwind") return 210 + heavyAdjustment;
+  if (phase === "vectoring") return 230 + heavyAdjustment;
+  return 250 + heavyAdjustment;
+}
+
+function altitudeForDeparturePhase(phase: Phase) {
+  if (phase === "departure") return 0;
+  if (phase === "takeoff") return 1800;
+  if (phase === "climb") return 7000;
+  if (phase === "outbound") return 12000;
+  return 15000;
+}
+
+function speedForDeparturePhase(phase: Phase, mode: ControlMode) {
+  if (phase === "departure") return 0;
+  if (phase === "takeoff") return 165;
+  if (phase === "climb") return mode === "ai" ? 250 : 235;
+  return mode === "ai" ? 270 : 250;
+}
+
+function headingBetween(from: Point, to: Point) {
+  const heading = Math.atan2(to.x - from.x, -(to.y - from.y)) * (180 / Math.PI);
+  return Math.round(heading < 0 ? heading + 360 : heading);
 }
 
 export function calculateMetrics(aircraft: Aircraft[], mode: ControlMode): Metrics {

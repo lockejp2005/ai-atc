@@ -32,7 +32,7 @@ export function SequencePanel({
               <span>
                 <span className="block font-mono text-slate-900">{ac.callsign}</span>
                 <span className="text-xs text-slate-500">
-                  {ac.phase} / +{formatDuration(ac.delay)}
+                  {slotStatus(ac)} / +{formatDuration(ac.delay)}
                 </span>
               </span>
               <span className="font-mono text-xs text-blue-800">{ac.slot}</span>
@@ -45,4 +45,10 @@ export function SequencePanel({
 
 function sortSequence(sequence: number) {
   return sequence || Number.MAX_SAFE_INTEGER;
+}
+
+function slotStatus(ac: Aircraft) {
+  if (ac.operation === "arrival" && ac.phase === "landed") return "LANDED";
+  if (ac.operation === "departure" && ac.phase === "departed") return "DONE";
+  return ac.phase;
 }

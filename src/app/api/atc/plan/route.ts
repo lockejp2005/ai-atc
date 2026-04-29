@@ -1,4 +1,4 @@
-import { planArrivalsWithTrace } from "@/lib/server/atc-planner";
+import { planArrivalsWithLlmSupervisor } from "@/lib/server/atc-planner";
 import type { Aircraft, ControlMode } from "@/types/atc";
 
 type PlanRequest = {
@@ -13,5 +13,5 @@ export async function POST(request: Request) {
     return Response.json({ error: "Invalid planning request" }, { status: 400 });
   }
 
-  return Response.json(planArrivalsWithTrace(body.aircraft, body.mode));
+  return Response.json(await planArrivalsWithLlmSupervisor(body.aircraft, body.mode));
 }

@@ -1,26 +1,238 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #eef5fb;
+  --foreground: #102033;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --font-sans: var(--font-aviation-sans);
+  --font-mono: var(--font-aviation-mono);
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-aviation-sans), Arial, Helvetica, sans-serif;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+
+.feed-arrival {
+  animation: feed-arrival 360ms ease-out both;
+}
+
+@keyframes feed-arrival {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.leaflet-container {
+  background: #edf5fb;
+  color: #17324d;
+  font-family: var(--font-aviation-sans), Arial, Helvetica, sans-serif;
+}
+
+.leaflet-control-zoom {
+  border: 1px solid rgba(37, 99, 235, 0.16) !important;
+  border-radius: 0 !important;
+  overflow: hidden;
+  box-shadow: 0 10px 24px rgba(37, 99, 235, 0.12) !important;
+}
+
+.leaflet-control-zoom a {
+  width: 34px !important;
+  height: 34px !important;
+  border: 0 !important;
+  background: rgba(248, 252, 255, 0.94) !important;
+  color: #1d4ed8 !important;
+  line-height: 34px !important;
+}
+
+.leaflet-control-zoom a:hover {
+  background: #dbeafe !important;
+}
+
+.terminal-map-label span,
+.terminal-fix-label span,
+.terminal-hold-label span {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  border-radius: 0;
+  border: 1px solid rgba(37, 99, 235, 0.18);
+  background: rgba(248, 252, 255, 0.88);
+  padding: 0 7px;
+  color: #17324d;
+  font-family: var(--font-aviation-mono), monospace;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0;
+  white-space: nowrap;
+  box-shadow: 0 8px 18px rgba(37, 99, 235, 0.12);
+}
+
+.terminal-fix-label span {
+  border-color: rgba(37, 99, 235, 0.36);
+  color: #1d4ed8;
+}
+
+.terminal-hold-label span {
+  border-color: rgba(37, 99, 235, 0.18);
+  color: #49647f;
+}
+
+.aircraft-div-icon {
+  background: transparent;
+  border: 0;
+}
+
+.aircraft-track {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 124px;
+  height: 58px;
+  border: 0;
+  background: transparent;
+  color: #102033;
+  text-align: left;
+  overflow: visible;
+}
+
+.aircraft-symbol {
+  position: relative;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--aircraft-blue, rgb(29, 78, 216));
+  filter: drop-shadow(0 0 8px color-mix(in srgb, var(--aircraft-blue, #2563eb) 46%, transparent));
+}
+
+.aircraft-symbol::before {
+  position: absolute;
+  inset: -4px;
+  border: 1px solid color-mix(in srgb, var(--aircraft-blue, #2563eb) 38%, transparent);
+  border-radius: 999px;
+  content: "";
+}
+
+.aircraft-symbol::after {
+  position: absolute;
+  inset: -7px;
+  border-radius: 999px;
+  content: "";
+  opacity: 0;
+  pointer-events: none;
+}
+
+.aircraft-symbol svg {
+  width: 15px;
+  height: 15px;
+  fill: #f8fbff;
+}
+
+.aircraft-tag {
+  display: grid;
+  min-width: 52px;
+  border-radius: 0;
+  border: 1px solid rgba(37, 99, 235, 0.16);
+  background: rgba(248, 252, 255, 0.9);
+  padding: 2px 5px;
+  box-shadow: 0 8px 18px rgba(37, 99, 235, 0.12);
+  transform: translate(var(--tag-x, 0), var(--tag-y, 0));
+  will-change: transform;
+}
+
+.aircraft-tag strong,
+.aircraft-tag small {
+  font-family: var(--font-aviation-mono), monospace;
+  line-height: 1.05;
+  letter-spacing: 0;
+}
+
+.aircraft-tag strong {
+  color: #17324d;
+  font-size: 10px;
+}
+
+.aircraft-tag small {
+  margin-top: 2px;
+  color: #5d7895;
+  font-size: 9px;
+}
+
+.aircraft-div-icon.is-selected .aircraft-symbol {
+  filter: drop-shadow(0 0 12px rgba(37, 99, 235, 0.55));
+}
+
+.aircraft-div-icon.is-selected .aircraft-symbol::before,
+.aircraft-div-icon.is-selected .aircraft-tag {
+  border-color: rgba(37, 99, 235, 0.65);
+}
+
+.aircraft-div-icon.is-holding .aircraft-symbol svg {
+  fill: #eaf2ff;
+}
+
+.aircraft-div-icon.is-holding .aircraft-symbol {
+  filter: drop-shadow(0 0 8px rgba(37, 99, 235, 0.22));
+}
+
+.aircraft-div-icon.is-talking .aircraft-symbol {
+  filter:
+    drop-shadow(0 0 7px rgba(250, 204, 21, 0.95))
+    drop-shadow(0 0 18px rgba(250, 204, 21, 0.68));
+}
+
+.aircraft-div-icon.is-talking .aircraft-symbol::after {
+  border: 2px solid rgba(250, 204, 21, 0.88);
+  box-shadow: 0 0 18px rgba(250, 204, 21, 0.74);
+  opacity: 1;
+}
+
+.aircraft-div-icon.is-talking .aircraft-tag {
+  border-color: rgba(250, 204, 21, 0.86);
+  box-shadow: 0 0 18px rgba(250, 204, 21, 0.34);
+}
+
+.aircraft-div-icon.is-final .aircraft-symbol svg {
+  fill: #ffffff;
+}
+
+.aircraft-div-icon.is-departure .aircraft-symbol {
+  background: #047857;
+  filter: drop-shadow(0 0 8px rgba(4, 120, 87, 0.38));
+}
+
+.aircraft-div-icon.is-departure .aircraft-symbol::before {
+  border-color: rgba(4, 120, 87, 0.42);
+}
+
+.aircraft-div-icon.is-departure .aircraft-tag {
+  border-color: rgba(4, 120, 87, 0.24);
+}
+
+.aircraft-div-icon.is-heavy .aircraft-tag strong::after {
+  color: #1d4ed8;
+  content: " H";
 }
